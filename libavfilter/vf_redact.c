@@ -51,6 +51,7 @@
  * reference megapixels to the top left, rather than absolute grid?
  */
 
+#include "libavutil/avstring.h"
 #include "libavutil/colorspace.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/parseutils.h"
@@ -103,9 +104,9 @@ static BoxTrack *box_track_from_string(const char *track_def,
   boxtrack->method = redact_pixellate;
 
   // todo: allow the granularity of the pixellation to be specified.
-  if (strncasecmp(method, "pixel", 5) == 0)
+  if (av_strncasecmp(method, "pixel", 5) == 0)
     boxtrack->method = redact_pixellate;
-  else if (strncasecmp(method, "inv", 3) == 0)
+  else if (av_strncasecmp(method, "inv", 3) == 0)
     boxtrack->method = redact_inverse_pixellate;
   else {
     uint8_t rgba_color[4];
