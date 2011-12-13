@@ -25,76 +25,114 @@
  * based on af_volume.c and vf_redact.c code
  */
 
+#include "libavutil/avstring.h"
 #include "libavutil/audioconvert.h"
 #include "libavutil/eval.h"
 #include "avfilter.h"
 
-typedef struct {
-    double volume;
-    int    volume_i;
-} RedactionContext;
+enum { Y, U, V, A };
 
-/*
 typedef enum {redact_mute, redact_noise}
-  redaction_method;
+    redaction_method;
 typedef struct {
-  int l, r, t, b;
-  double start, end;
-  redaction_method method;
-  unsigned char yuv_color[4];  // Used when method is redact_solid
+    int l, r, t, b;
+    double start, end;
+    redaction_method method;
+    unsigned char yuv_color[4];  // Used when method is redact_solid
 } BoxTrack;
 
 typedef struct {
-  int vsub, hsub;   //< chroma subsampling
-  int numtracks;
-  double time_seconds;
-  BoxTrack **boxtracks;
+    int vsub, hsub;   //< chroma subsampling
+    int numtracks;
+    double time_seconds;
+    BoxTrack **boxtracks;
 } RedactionContext;
-*/
+
+static BoxTrack *box_track_from_string(const char *track_def,
+                                       AVFilterContext *ctx) {
+    BoxTrack *boxtrack = NULL;
+    int rv = 0;
+    int l, r, t, b;
+#define BUFLEN 1000
+    char method[BUFLEN];
+    double start, end;
+
+    // Allow comments, empty lines.
+    if (track_def[0] == '#' || track_def[0] == '\0')
+        return NULL;
+
+    rv = sscanf(track_def, "%lf,%lf,%d,%d,%d,%d,%s", &start,&end, 
+                &l, &r, &t, &b, method);
+    if (rv != 7) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to parse boxtrack '%s' .\n", track_def);
+        return NULL;
+    }
+    boxtrack = (BoxTrack *)av_malloc(sizeof(BoxTrack));
+    boxtrack->l = l;
+    boxtrack->r = r;
+    boxtrack->t = t;
+    boxtrack->b = b;
+    boxtrack->start = start;
+    boxtrack->end = end;
+    boxtrack->method = redact_mute;
+
+    if (av_strncasecmp(method, "noise", 5) == 0)
+        boxtrack->method = redact_noise;
+    else
+        av_log(ctx, AV_LOG_ERROR, "Unknown audio redaction method '%s', using 'mute' .\n",
+               method);
+
+    av_log(ctx, AV_LOG_WARNING, "ROAR!!!!! %s .\n", method);
+
+    return boxtrack;
+}
+
 
 static av_cold int init(AVFilterContext *ctx, const char *args, void *opaque)
 {
-    RedactionContext *vol = ctx->priv;
-    char *tail;
-    int ret = 0;
+    RedactionContext *redaction = ctx->priv;
+    FILE *file = NULL;
+    char buf[BUFLEN];
 
-    vol->volume = 1.0;
-
-    if (args) {
-        /* parse the number as a decimal number */
-        double d = strtod(args, &tail);
-
-        if (*tail) {
-            if (!strcmp(tail, "dB")) {
-                /* consider the argument an adjustement in decibels */
-                if (!strcmp(tail, "dB")) {
-                    d = pow(10,d/20);
-                }
-            } else {
-                /* parse the argument as an expression */
-                ret = av_expr_parse_and_eval(&d, args, NULL, NULL,
-                                             NULL, NULL, NULL, NULL,
-                                             NULL, 0, ctx);
-            }
-        }
-
-        if (ret < 0) {
-            av_log(ctx, AV_LOG_ERROR,
-                   "Invalid volume argument '%s'\n", args);
-            return AVERROR(EINVAL);
-        }
-
-        if (d < 0 || d > 65536) { /* 65536 = INT_MIN / (128 * 256) */
-            av_log(ctx, AV_LOG_ERROR,
-                   "Negative or too big volume value %f\n", d);
-            return AVERROR(EINVAL);
-        }
-
-        vol->volume = d;
+    redaction->boxtracks = NULL;
+    redaction->time_seconds = NAN;
+    if (!args) {
+        av_log(ctx, AV_LOG_ERROR, "No arguments given to redact.\n");
+        return 1;
     }
+    file = fopen(args, "r");
+    if (!file)  {
+        av_log(ctx, AV_LOG_ERROR, "Can't open redaction file: '%s'\n", args);
+        return 2;
+    }
+    redaction->numtracks = 0;
+    // Parse the config file.
+    while (!feof(file)) {
+        BoxTrack **boxtracks = NULL;
+        BoxTrack *new_track = NULL;
 
-    vol->volume_i = (int)(vol->volume * 256 + 0.5);
-    av_log(ctx, AV_LOG_INFO, "volume=%f\n", vol->volume);
+        if (fgets(buf, BUFLEN, file) == NULL) break; // EOF
+        new_track = box_track_from_string(buf, ctx);
+        if (new_track == NULL)
+            continue;
+        // Resize the array and add the new track.
+        boxtracks = (BoxTrack **)av_malloc((redaction->numtracks + 1) *
+                                           sizeof(BoxTrack *));
+        for (int i = 0; i < redaction->numtracks; ++i)
+            boxtracks[i] = redaction->boxtracks[i];
+        boxtracks[redaction->numtracks++] = new_track;
+        av_free(redaction->boxtracks);
+        redaction->boxtracks = boxtracks;
+    }
+    fclose(file);
+    // Sort the tracks so the earliest-starting are at the end of the array.
+    for (int j = 0; j < redaction->numtracks -1; ++j)
+        for (int k = j + 1; k < redaction->numtracks; ++k)
+            if (redaction->boxtracks[j]->start < redaction->boxtracks[k]->start) {
+                BoxTrack *temp = redaction->boxtracks[j];
+                redaction->boxtracks[j] = redaction->boxtracks[k];
+                redaction->boxtracks[k] = temp;
+            }
     return 0;
 }
 
@@ -131,63 +169,53 @@ static int query_formats(AVFilterContext *ctx)
 
 static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
 {
-    RedactionContext *vol = inlink->dst->priv;
+    RedactionContext *redaction = inlink->dst->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
     const int nb_samples = insamples->audio->nb_samples *
         av_get_channel_layout_nb_channels(insamples->audio->channel_layout);
-    const double volume   = vol->volume;
-    const int    volume_i = vol->volume_i;
     int i;
 
-
-    if (volume_i != 256) {
-        switch (insamples->format) {
-        case AV_SAMPLE_FMT_U8:
-        {
-            uint8_t *p = (void *)insamples->data[0];
-            for (i = 0; i < nb_samples; i++) {
-                int v = (((*p - 128) * volume_i + 128) >> 8) + 128;
-                *p++ = av_clip_uint8(v);
-            }
-            break;
+    switch (insamples->format) {
+    case AV_SAMPLE_FMT_U8:
+    {
+        uint8_t *p = (void *)insamples->data[0];
+        for (i = 0; i < nb_samples; i++) {
+            *p++ = 0;
         }
-        case AV_SAMPLE_FMT_S16:
-        {
-            int16_t *p = (void *)insamples->data[0];
-            for (i = 0; i < nb_samples; i++) {
-                int v = ((int64_t)*p * volume_i + 128) >> 8;
-                *p++ = av_clip_int16(v);
-            }
-            break;
+        break;
+    }
+    case AV_SAMPLE_FMT_S16:
+    {
+        int16_t *p = (void *)insamples->data[0];
+        for (i = 0; i < nb_samples; i++) {
+            *p++ = 0;
         }
-        case AV_SAMPLE_FMT_S32:
-        {
-            int32_t *p = (void *)insamples->data[0];
-            for (i = 0; i < nb_samples; i++) {
-                int64_t v = (((int64_t)*p * volume_i + 128) >> 8);
-                *p++ = av_clipl_int32(v);
-            }
-            break;
+        break;
+    }
+    case AV_SAMPLE_FMT_S32:
+    {
+        int32_t *p = (void *)insamples->data[0];
+        for (i = 0; i < nb_samples; i++) {
+            *p++ = 0;
         }
-        case AV_SAMPLE_FMT_FLT:
-        {
-            float *p = (void *)insamples->data[0];
-            float scale = (float)volume;
-            for (i = 0; i < nb_samples; i++) {
-                *p++ *= scale;
-            }
-            break;
+        break;
+    }
+    case AV_SAMPLE_FMT_FLT:
+    {
+        float *p = (void *)insamples->data[0];
+        for (i = 0; i < nb_samples; i++) {
+            *p++ = 0.0;
         }
-        case AV_SAMPLE_FMT_DBL:
-        {
-            double *p = (void *)insamples->data[0];
-            for (i = 0; i < nb_samples; i++) {
-                *p *= volume;
-                p++;
-            }
-            break;
+        break;
+    }
+    case AV_SAMPLE_FMT_DBL:
+    {
+        double *p = (void *)insamples->data[0];
+        for (i = 0; i < nb_samples; i++) {
+            *p++ = 0.0;
         }
-        }
+        break;
+    }
     }
     avfilter_filter_samples(outlink, insamples);
 }
