@@ -75,6 +75,8 @@ static BoxTrack *box_track_from_string(const char *track_def,
         boxtrack->method = redact_mute;
     else if (av_strncasecmp(methodbuf, "noise", 5) == 0)
         boxtrack->method = redact_noise;
+    else if (av_strncasecmp(methodbuf, "resample", 8) == 0)
+        boxtrack->method = redact_resample;
     else if (av_strncasecmp(methodbuf, "buzzer", 6) == 0)
         boxtrack->method = redact_buzzer;
     else if (av_strncasecmp(methodbuf, "none", 4) == 0)
@@ -198,11 +200,10 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
             redaction->boxtracks[--redaction->numtracks] = NULL;
         } else {
             method = boxtrack->method;
+            break; // use the first redaction time found for this timeslice
         }
     }
 
-    av_log(inlink->dst, AV_LOG_WARNING, "time %f method %i\n",
-           redaction->time_seconds, method);
     if (method != redact_none) {
         switch (insamples->format) {
         case AV_SAMPLE_FMT_U8:
@@ -221,6 +222,17 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                 for (i = 0; i < nb_samples; i++) {
                     *p++ = state / 2;
                     state = state*1664525+1013904223;
+                }
+                break;
+            }
+            case redact_resample:
+            {
+                uint8_t sample = *p;
+                int modval = inlink->sample_rate / 1500;
+                for (i = 0; i < nb_samples; i++) {
+                    if (i % modval == 0)
+                        sample = *p;
+                    *p++ = sample;
                 }
                 break;
             }
@@ -246,6 +258,17 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                 }
                 break;
             }
+            case redact_resample:
+            {
+                int16_t sample = *p;
+                int modval = inlink->sample_rate / 1500;
+                for (i = 0; i < nb_samples; i++) {
+                    if (i % modval == 0)
+                        sample = *p;
+                    *p++ = sample;
+                }
+                break;
+            }
             }
             break;
         }
@@ -265,6 +288,17 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                 for (i = 0; i < nb_samples; i++) {
                     *p++ = state / 2;
                     state = state*1664525+1013904223;
+                }
+                break;
+            }
+            case redact_resample:
+            {
+                int32_t sample = *p;
+                int modval = inlink->sample_rate / 1500;
+                for (i = 0; i < nb_samples; i++) {
+                    if (i % modval == 0)
+                        sample = *p;
+                    *p++ = sample;
                 }
                 break;
             }
@@ -290,6 +324,17 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                 }
                 break;
             }
+            case redact_resample:
+            {
+                float sample = *p;
+                int modval = inlink->sample_rate / 1500;
+                for (i = 0; i < nb_samples; i++) {
+                    if (i % modval == 0)
+                        sample = *p;
+                    *p++ = sample;
+                }
+                break;
+            }
             }
             break;
         }
@@ -309,6 +354,17 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
                 for (i = 0; i < nb_samples; i++) {
                     *p++ = (double)state / 4294967296;
                     state = state*1664525+1013904223;
+                }
+                break;
+            }
+            case redact_resample:
+            {
+                double sample = *p;
+                int modval = inlink->sample_rate / 1500;
+                for (i = 0; i < nb_samples; i++) {
+                    if (i % modval == 0)
+                        sample = *p;
+                    *p++ = sample;
                 }
                 break;
             }
