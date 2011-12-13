@@ -38,6 +38,7 @@ void avfilter_register_all(void)
     REGISTER_FILTER (AFORMAT,     aformat,     af);
     REGISTER_FILTER (AMERGE,      amerge,      af);
     REGISTER_FILTER (ANULL,       anull,       af);
+    REGISTER_FILTER (AREDACT,     aredact,     af);
     REGISTER_FILTER (ARESAMPLE,   aresample,   af);
     REGISTER_FILTER (ASHOWINFO,   ashowinfo,   af);
     REGISTER_FILTER (ASPLIT,      asplit,      af);
