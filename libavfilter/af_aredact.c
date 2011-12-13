@@ -30,19 +30,18 @@
 #include "libavutil/eval.h"
 #include "avfilter.h"
 
-enum { Y, U, V, A };
+/* for lazy char* allocation */
+#define BUFLEN 1000
 
-typedef enum {redact_mute, redact_noise}
+typedef enum {redact_none, redact_mute, redact_noise}
     redaction_method;
+
 typedef struct {
-    int l, r, t, b;
     double start, end;
     redaction_method method;
-    unsigned char yuv_color[4];  // Used when method is redact_solid
 } BoxTrack;
 
 typedef struct {
-    int vsub, hsub;   //< chroma subsampling
     int numtracks;
     double time_seconds;
     BoxTrack **boxtracks;
@@ -52,37 +51,33 @@ static BoxTrack *box_track_from_string(const char *track_def,
                                        AVFilterContext *ctx) {
     BoxTrack *boxtrack = NULL;
     int rv = 0;
-    int l, r, t, b;
-#define BUFLEN 1000
-    char method[BUFLEN];
+    char methodbuf[BUFLEN];
     double start, end;
 
     // Allow comments, empty lines.
     if (track_def[0] == '#' || track_def[0] == '\0')
         return NULL;
 
-    rv = sscanf(track_def, "%lf,%lf,%d,%d,%d,%d,%s", &start,&end, 
-                &l, &r, &t, &b, method);
-    if (rv != 7) {
+    rv = sscanf(track_def, "%lf,%lf,%s", &start,&end,methodbuf);
+    if (rv != 3) {
         av_log(ctx, AV_LOG_ERROR, "Failed to parse boxtrack '%s' .\n", track_def);
         return NULL;
     }
     boxtrack = (BoxTrack *)av_malloc(sizeof(BoxTrack));
-    boxtrack->l = l;
-    boxtrack->r = r;
-    boxtrack->t = t;
-    boxtrack->b = b;
     boxtrack->start = start;
     boxtrack->end = end;
-    boxtrack->method = redact_mute;
 
-    if (av_strncasecmp(method, "noise", 5) == 0)
+    if (av_strncasecmp(methodbuf, "mute", 4) == 0)
+        boxtrack->method = redact_mute;
+    else if (av_strncasecmp(methodbuf, "noise", 5) == 0)
         boxtrack->method = redact_noise;
-    else
+    else if (av_strncasecmp(methodbuf, "none", 4) == 0)
+        boxtrack->method = redact_none;
+    else {
+        boxtrack->method = redact_mute;
         av_log(ctx, AV_LOG_ERROR, "Unknown audio redaction method '%s', using 'mute' .\n",
-               method);
-
-    av_log(ctx, AV_LOG_WARNING, "ROAR!!!!! %s .\n", method);
+               methodbuf);
+    }
 
     return boxtrack;
 }
@@ -95,7 +90,7 @@ static av_cold int init(AVFilterContext *ctx, const char *args, void *opaque)
     char buf[BUFLEN];
 
     redaction->boxtracks = NULL;
-    redaction->time_seconds = NAN;
+    redaction->time_seconds = 0.0;
     if (!args) {
         av_log(ctx, AV_LOG_ERROR, "No arguments given to redact.\n");
         return 1;
@@ -173,50 +168,86 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
     AVFilterLink *outlink = inlink->dst->outputs[0];
     const int nb_samples = insamples->audio->nb_samples *
         av_get_channel_layout_nb_channels(insamples->audio->channel_layout);
-    int i;
+    int i, box;
+    BoxTrack *boxtrack;
+    redaction_method method = redact_none;
 
-    switch (insamples->format) {
-    case AV_SAMPLE_FMT_U8:
-    {
-        uint8_t *p = (void *)insamples->data[0];
-        for (i = 0; i < nb_samples; i++) {
-            *p++ = 0;
+    redaction->time_seconds = redaction->time_seconds + 
+        (((double) nb_samples) / inlink->sample_rate);
+
+/* first, figure out what action we are taking. "" means no action, that's
+ * the default.  "mute" means zero out the sample, and that overrides any
+ * other filter mode.  Otherwise, use the last specified filter type.
+ */
+    for (box = redaction->numtracks -1; box >= 0; --box) {
+        boxtrack = redaction->boxtracks[box];
+        // Tracks are sorted by start time, so if this one starts in the future
+        // all remaining ones will.
+        if (boxtrack->start > redaction->time_seconds)
+            goto finished;
+        if (boxtrack->end < redaction->time_seconds) {
+            // Delete any tracks we've passed.
+            av_free(redaction->boxtracks[box]);
+            // Shuffle down any still-active tracks higher in the array.
+            // (We've already processed them this frame.)
+            for (int t = box + 1; t < redaction->numtracks; ++t)
+                redaction->boxtracks[t - 1] = redaction->boxtracks[t];
+            // Reduce the count.
+            redaction->boxtracks[--redaction->numtracks] = NULL;
+        } else {
+            method = boxtrack->method;
+            if (method == redact_mute)
+                break;
         }
-        break;
     }
-    case AV_SAMPLE_FMT_S16:
-    {
-        int16_t *p = (void *)insamples->data[0];
-        for (i = 0; i < nb_samples; i++) {
-            *p++ = 0;
+
+    av_log(inlink->dst, AV_LOG_WARNING, "time %f redact %i\n",
+           redaction->time_seconds, method);
+    if (method != redact_none) {
+        switch (insamples->format) {
+        case AV_SAMPLE_FMT_U8:
+        {
+            uint8_t *p = (void *)insamples->data[0];
+            if (method == redact_mute)
+                for (i = 0; i < nb_samples; i++)
+                    *p++ = 0;
+            break;
         }
-        break;
-    }
-    case AV_SAMPLE_FMT_S32:
-    {
-        int32_t *p = (void *)insamples->data[0];
-        for (i = 0; i < nb_samples; i++) {
-            *p++ = 0;
+        case AV_SAMPLE_FMT_S16:
+        {
+            int16_t *p = (void *)insamples->data[0];
+            if (method == redact_mute)
+                for (i = 0; i < nb_samples; i++)
+                    *p++ = 0;
+            break;
         }
-        break;
-    }
-    case AV_SAMPLE_FMT_FLT:
-    {
-        float *p = (void *)insamples->data[0];
-        for (i = 0; i < nb_samples; i++) {
-            *p++ = 0.0;
+        case AV_SAMPLE_FMT_S32:
+        {
+            int32_t *p = (void *)insamples->data[0];
+            if (method == redact_mute)
+                for (i = 0; i < nb_samples; i++)
+                    *p++ = 0;
+            break;
         }
-        break;
-    }
-    case AV_SAMPLE_FMT_DBL:
-    {
-        double *p = (void *)insamples->data[0];
-        for (i = 0; i < nb_samples; i++) {
-            *p++ = 0.0;
+        case AV_SAMPLE_FMT_FLT:
+        {
+            float *p = (void *)insamples->data[0];
+            if (method == redact_mute)
+                for (i = 0; i < nb_samples; i++)
+                    *p++ = 0.0;
+            break;
         }
-        break;
+        case AV_SAMPLE_FMT_DBL:
+        {
+            double *p = (void *)insamples->data[0];
+            if (method == redact_mute)
+                for (i = 0; i < nb_samples; i++)
+                    *p++ = 0.0;
+            break;
+        }
+        }
     }
-    }
+finished:
     avfilter_filter_samples(outlink, insamples);
 }
 
