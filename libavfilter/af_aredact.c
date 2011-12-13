@@ -220,12 +220,22 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
     avfilter_filter_samples(outlink, insamples);
 }
 
+    static av_cold void uninit(AVFilterContext *ctx)
+    {
+        RedactionContext *redaction= ctx->priv;
+        for (int i = 0; i < redaction->numtracks; ++i) {
+            av_free(redaction->boxtracks[i]);
+        }
+        av_free(redaction->boxtracks);
+    }
+
 AVFilter avfilter_af_aredact = {
     .name           = "aredact",
     .description    = NULL_IF_CONFIG_SMALL("Redact the input audio according to a track file."),
     .query_formats  = query_formats,
     .priv_size      = sizeof(RedactionContext),
     .init           = init,
+    .uninit         = uninit,
 
     .inputs  = (const AVFilterPad[])  {{ .name     = "default",
                                    .type           = AVMEDIA_TYPE_AUDIO,
