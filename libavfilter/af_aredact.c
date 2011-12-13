@@ -33,8 +33,12 @@
 /* for lazy char* allocation */
 #define BUFLEN 1000
 
-typedef enum {redact_none, redact_mute, redact_noise}
-    redaction_method;
+typedef enum {redact_none,
+              redact_mute,
+              redact_noise,
+              redact_resample,
+              redact_buzzer
+} redaction_method;
 
 typedef struct {
     double start, end;
@@ -71,11 +75,13 @@ static BoxTrack *box_track_from_string(const char *track_def,
         boxtrack->method = redact_mute;
     else if (av_strncasecmp(methodbuf, "noise", 5) == 0)
         boxtrack->method = redact_noise;
+    else if (av_strncasecmp(methodbuf, "buzzer", 6) == 0)
+        boxtrack->method = redact_buzzer;
     else if (av_strncasecmp(methodbuf, "none", 4) == 0)
         boxtrack->method = redact_none;
     else {
         boxtrack->method = redact_mute;
-        av_log(ctx, AV_LOG_ERROR, "Unknown audio redaction method '%s', using 'mute' .\n",
+        av_log(ctx, AV_LOG_ERROR, "Unknown audio redaction method '%s', using 'mute'.\n",
                methodbuf);
     }
 
@@ -175,10 +181,6 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
     redaction->time_seconds = redaction->time_seconds + 
         (((double) nb_samples) / inlink->sample_rate);
 
-/* first, figure out what action we are taking. "" means no action, that's
- * the default.  "mute" means zero out the sample, and that overrides any
- * other filter mode.  Otherwise, use the last specified filter type.
- */
     for (box = redaction->numtracks -1; box >= 0; --box) {
         boxtrack = redaction->boxtracks[box];
         // Tracks are sorted by start time, so if this one starts in the future
@@ -196,53 +198,121 @@ static void filter_samples(AVFilterLink *inlink, AVFilterBufferRef *insamples)
             redaction->boxtracks[--redaction->numtracks] = NULL;
         } else {
             method = boxtrack->method;
-            if (method == redact_mute)
-                break;
         }
     }
 
-    av_log(inlink->dst, AV_LOG_WARNING, "time %f redact %i\n",
+    av_log(inlink->dst, AV_LOG_WARNING, "time %f method %i\n",
            redaction->time_seconds, method);
     if (method != redact_none) {
         switch (insamples->format) {
         case AV_SAMPLE_FMT_U8:
         {
             uint8_t *p = (void *)insamples->data[0];
-            if (method == redact_mute)
+            switch (method) {
+            case redact_mute:
+            {
                 for (i = 0; i < nb_samples; i++)
                     *p++ = 0;
+                break;
+            }
+            case redact_buzzer:
+            {
+                uint8_t state = 0;
+                for (i = 0; i < nb_samples; i++) {
+                    *p++ = state / 2;
+                    state = state*1664525+1013904223;
+                }
+                break;
+            }
+            }
             break;
         }
         case AV_SAMPLE_FMT_S16:
         {
             int16_t *p = (void *)insamples->data[0];
-            if (method == redact_mute)
+            switch (method) {
+            case redact_mute:
+            {
                 for (i = 0; i < nb_samples; i++)
                     *p++ = 0;
+                break;
+            }
+            case redact_buzzer:
+            {
+                int16_t state = 0;
+                for (i = 0; i < nb_samples; i++) {
+                    *p++ = state / 2;
+                    state = state*1664525+1013904223;
+                }
+                break;
+            }
+            }
             break;
         }
         case AV_SAMPLE_FMT_S32:
         {
             int32_t *p = (void *)insamples->data[0];
-            if (method == redact_mute)
+            switch (method) {
+            case redact_mute:
+            {
                 for (i = 0; i < nb_samples; i++)
                     *p++ = 0;
+                break;
+            }
+            case redact_buzzer:
+            {
+                int32_t state = 0;
+                for (i = 0; i < nb_samples; i++) {
+                    *p++ = state / 2;
+                    state = state*1664525+1013904223;
+                }
+                break;
+            }
+            }
             break;
         }
         case AV_SAMPLE_FMT_FLT:
         {
             float *p = (void *)insamples->data[0];
-            if (method == redact_mute)
+            switch (method) {
+            case redact_mute:
+            {
                 for (i = 0; i < nb_samples; i++)
                     *p++ = 0.0;
+                break;
+            }
+            case redact_buzzer:
+            {
+                int32_t state = 0;
+                for (i = 0; i < nb_samples; i++) {
+                    *p++ = (float)state / 4294967296;
+                    state = state*1664525+1013904223;
+                }
+                break;
+            }
+            }
             break;
         }
         case AV_SAMPLE_FMT_DBL:
         {
             double *p = (void *)insamples->data[0];
-            if (method == redact_mute)
+            switch (method) {
+            case redact_mute:
+            {
                 for (i = 0; i < nb_samples; i++)
                     *p++ = 0.0;
+                break;
+            }
+            case redact_buzzer:
+            {
+                int32_t state = 0;
+                for (i = 0; i < nb_samples; i++) {
+                    *p++ = (double)state / 4294967296;
+                    state = state*1664525+1013904223;
+                }
+                break;
+            }
+            }
             break;
         }
         }
