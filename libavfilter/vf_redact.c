@@ -21,6 +21,7 @@
  * coordinates increase down and to right.)
  * finally a redaction method string is given which is either "pixel" for
  * pixellation, "inverse" for inverse pixellation (not yet implemented)
+ * "blur" for face blurring.
  * or an ffmpeg color specifier for solid redaction. 
  * The file can contain comments, ie lines beginning with "#".
  */
@@ -53,13 +54,18 @@
 
 #include "libavutil/avstring.h"
 #include "libavutil/colorspace.h"
+#include "libavutil/lfg.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/parseutils.h"
 #include "avfilter.h"
+#include <strings.h>
 
 enum { Y, U, V, A };
-
-typedef enum {redact_solid, redact_pixellate, redact_inverse_pixellate}
+static int logging = 0;
+typedef enum {redact_solid, 
+	      redact_pixellate, 
+	      redact_inverse_pixellate, 
+	      redact_blur}
   redaction_method;
 typedef struct {
   int l, r, t, b;
@@ -73,7 +79,44 @@ typedef struct {
   int numtracks;
   double time_seconds;
   BoxTrack **boxtracks;
+  AVLFG random;
+  AVFilterBufferRef *lastredacted;    ///< Previous frame
 } RedactionContext;
+
+static void log_box_track(BoxTrack *bt,
+			  AVFilterContext *ctx) {
+  av_log(ctx, AV_LOG_INFO, "Box track: %d: (%.1f-%.1fs) %d-%d x %d-%d\n", 
+	 bt->method, bt->start, bt->end,
+	 bt->l, bt->r, bt->t, bt->b);
+}
+
+// memory status stuff from
+// stackoverflow.com/questions/1558402/memory-usage-of-current-process-in-c
+typedef struct {
+    unsigned long size,resident,share,text,lib,data,dt;
+} statm_t;
+
+static void read_off_memory_status(statm_t * result)
+{
+  const char* statm_path = "/proc/self/statm";
+
+  FILE *f = fopen(statm_path,"r");
+  if(!f){
+    abort();
+  }
+  if(7 != fscanf(f,"%ld %ld %ld %ld %ld %ld %ld",
+		 &result->size,
+		 &result->resident,
+		 &result->share,
+		 &result->text,
+		 &result->lib,
+		 &result->data,
+		 &result->dt))
+  {
+    abort();
+  }
+  fclose(f);
+}
 
 static BoxTrack *box_track_from_string(const char *track_def,
 				       AVFilterContext *ctx) {
@@ -108,6 +151,8 @@ static BoxTrack *box_track_from_string(const char *track_def,
     boxtrack->method = redact_pixellate;
   else if (av_strncasecmp(method, "inv", 3) == 0)
     boxtrack->method = redact_inverse_pixellate;
+  else if (av_strncasecmp(method, "blur", 4) == 0)
+    boxtrack->method = redact_blur;
   else {
     uint8_t rgba_color[4];
 
@@ -132,8 +177,9 @@ static av_cold int init(AVFilterContext *ctx, const char *args, void *opaque)
     RedactionContext *redaction= ctx->priv;
     FILE *file = NULL;
     char buf[BUFLEN];
-
+    unsigned int seed=298379;
     redaction->boxtracks = NULL;
+    redaction->lastredacted = NULL;
     redaction->time_seconds = NAN;
     if (!args) {
       av_log(ctx, AV_LOG_ERROR, "No arguments given to redact.\n");
@@ -151,9 +197,17 @@ static av_cold int init(AVFilterContext *ctx, const char *args, void *opaque)
       BoxTrack *new_track = NULL;
 
       if (fgets(buf, BUFLEN, file) == NULL) break; // EOF
+      if (strncmp(buf, "seed", 4) == 0) {
+	int rv = sscanf(buf, "seed %ud", &seed);
+	if (rv != 1)
+	  av_log(ctx, AV_LOG_ERROR, "Didn't parse seed: %s.\n", buf);
+
+	continue;
+      }
       new_track = box_track_from_string(buf, ctx);
       if (new_track == NULL)
 	continue;
+      log_box_track(new_track, ctx);
       // Resize the array and add the new track.
       boxtracks = (BoxTrack **)av_malloc((redaction->numtracks + 1) *
 					 sizeof(BoxTrack *));
@@ -163,6 +217,8 @@ static av_cold int init(AVFilterContext *ctx, const char *args, void *opaque)
       av_free(redaction->boxtracks);
       redaction->boxtracks = boxtracks;
     }
+    av_log(ctx, AV_LOG_INFO, "Seed is : '%ud'\n", seed);
+    av_lfg_init(&redaction->random, seed);
     fclose(file);
     // Sort the tracks so the earliest-starting are at the end of the array.
     for (int j = 0; j < redaction->numtracks -1; ++j)
@@ -197,8 +253,8 @@ static int config_input(AVFilterLink *inlink)
     redaction->hsub = av_pix_fmt_descriptors[inlink->format].log2_chroma_w;
     redaction->vsub = av_pix_fmt_descriptors[inlink->format].log2_chroma_h;
 
-    av_log(inlink->dst, AV_LOG_INFO, "Redaction with %d tracks\n",
-	   redaction->numtracks);
+    av_log(inlink->dst, AV_LOG_INFO, "Redaction with %d tracks %d %d\n",
+	   redaction->numtracks, redaction->hsub, redaction->vsub);
 
     return 0;
 }
@@ -206,20 +262,324 @@ static int config_input(AVFilterLink *inlink)
 // Decode the timestamp.
 static void start_frame(AVFilterLink *inlink, AVFilterBufferRef *picref)
 {
+  AVFilterContext *ctx = inlink->dst;
   RedactionContext *redaction = inlink->dst->priv;
+  AVFilterLink *outlink0 = inlink->dst->outputs[0];
+  AVFilterLink *outlink1 = inlink->dst->outputs[1];
+  AVFilterBufferRef *outpicref = NULL;
+  
+  if (logging)
+    av_log(ctx, AV_LOG_INFO, "startstartframe\n");
   redaction->time_seconds = picref->pts * av_q2d(inlink->time_base);
-  avfilter_start_frame(inlink->dst->outputs[0],
-		       avfilter_ref_buffer(picref, ~0));
+  outpicref = avfilter_get_video_buffer(outlink0, AV_PERM_WRITE,
+					outlink0->w, outlink0->h);
+  avfilter_copy_buffer_ref_props(outpicref, picref);
+  outpicref->video->w = outlink0->w;
+  outpicref->video->h = outlink0->h;
+  outlink0->out_buf = outpicref;
+  outlink0->out_buf->pts = picref->pts;
+  outlink0->out_buf->pos = picref->pos;
+
+  avfilter_start_frame(outlink0,
+		       avfilter_ref_buffer(outlink0->out_buf,  ~0));
+
+  outpicref = avfilter_get_video_buffer(outlink1, AV_PERM_WRITE,
+					outlink1->w, outlink1->h);
+  avfilter_copy_buffer_ref_props(outpicref, picref);
+  outpicref->video->w = outlink0->w;
+  outpicref->video->h = outlink0->h;
+  outlink1->out_buf = outpicref;
+  outlink1->out_buf->pts = picref->pts;
+  outlink1->out_buf->pos = picref->pos;
+  avfilter_start_frame(outlink1,outlink1->out_buf);
+  //		       avfilter_ref_buffer(outlink1->out_buf,  ~0));
+  if (logging)
+    av_log(ctx, AV_LOG_INFO, "endstartframe\n");
 }
 
-static void draw_slice(AVFilterLink *inlink, int y0, int h, int slice_dir)
-{
-  RedactionContext *redaction = inlink->dst->priv;
-  int x, y;
-  unsigned char *row[4];
-  AVFilterBufferRef *picref = inlink->cur_buf;
+static int noise = 10;
+static void convolve_ny(int t, int b, int maxy,
+			unsigned char *row, int blur, unsigned char *blurbuf,
+			int step,
+			AVLFG *random) {
+  int halfblur = blur/2;
+  int blursum = 0;
+  int i;
+  for (i = 0; i < blur; ++i) {
+    int pos = t + i - halfblur;
+    blurbuf[i] = (pos <= 0) ? row[0] : row[pos * step];
+    blursum += blurbuf[i];
+  }
+  for (int y = t; y < b; ++y, ++i) {
+    int newval = blursum / blur;
+    int newpos = y + (blur + 1)/2;
+    i %= blur;
+    if (noise > 0) {
+      newval += (av_lfg_get(random) % (2 * noise + 1)) - noise;
+      if (newval < 0 ) newval = 0;
+      else if (newval > 255) newval = 255;
+    }
+    row[y*step] = newval;
+    blursum -= blurbuf[i];
+    blurbuf[i] = row[step * ((newpos < maxy) ? newpos : (maxy - 1))];
+    blursum += blurbuf[i];
+  }
+}
+// Keep a rolling buffer of n values and their sum.
+// Store the average in the output vector and update the sum by dropping one
+// value and inserting another.
+static void convolve_nx(int l, int r, int maxx,
+			unsigned char *row, int blur, unsigned char *blurbuf,
+			AVLFG *random) {
+  int halfblur = blur/2;
+  int blursum = 0;
+  int i;
+  for (i = 0; i < blur; ++i) {
+    int pos = l + i - halfblur;
+    blurbuf[i] = (pos <= 0) ? row[0] : row[pos];
+    blursum += blurbuf[i];
+  }
+  for (int x = l; x < r; ++x, ++i) {
+    int newval = blursum / blur;
+    int newpos = x + (blur + 1)/2;
+    i %= blur;
+    if (noise > 0) {
+      newval += (av_lfg_get(random) % (2 * noise + 1)) - noise;
+      if (newval < 0 ) newval = 0;
+      else if (newval > 255) newval = 255;
+    }
+    row[x] = newval;
+    blursum -= blurbuf[i];
+    blurbuf[i] = row[(newpos < maxx) ? newpos : (maxx - 1)];
+    blursum += blurbuf[i];
+  }
+}
 
-  for (int box = redaction->numtracks -1; box >= 0; --box) {
+static void blur_one_round(AVFilterBufferRef *picref, BoxTrack *boxtrack,
+			   int y0, int h, int hsub, int vsub,
+			   int blur, unsigned char *blurbuf,
+			   AVLFG *random) {
+  int xb = boxtrack->l, yb = boxtrack->t;
+  int hb = boxtrack->b - boxtrack->t;
+  int wb = boxtrack->r - boxtrack->l;
+  int x, y;
+  int xmax, ymax;
+
+#define BLURX
+#define BLURY
+#ifdef BLURX  
+  x = FFMAX(xb, 0);
+  blur = wb/2;
+  xmax = FFMIN( (xb + wb), picref->video->w);
+  for (y = FFMAX(yb, y0); y < (y0 + h) && y < (yb + hb); ++y) {
+    for (int plane = 0; plane < 3; plane++) {
+      int ds = (plane == 0) ? 0 : hsub;
+      unsigned char *row = picref->data[plane] +
+	picref->linesize[plane] * (y >> ((plane == 0) ? 0 : vsub));
+      convolve_nx(x >> ds, (xmax + ((1<<ds) -1))>> ds, picref->video->w >> ds,
+		  row,
+		  (blur  + ((1<<ds) -1))>> ds, blurbuf, random);
+    }
+  }
+#endif
+#ifdef BLURY
+  y  = FFMAX(yb, y0);
+  ymax = FFMIN( (yb + hb), (y0 + h));
+  blur = hb/2;
+  for (x = FFMAX(xb, 0); x < (xb + wb) && x < picref->video->w; x++) {
+    for (int plane = 0; plane < 3; plane++) {
+      int ds = (plane == 0) ? 0 : vsub;
+      unsigned char *col = picref->data[plane] + (x >>  ((plane == 0) ? 0 : hsub));
+      convolve_ny(y >> ds, (ymax + ((1<<ds) -1))  >> ds,
+		  (y0 + h) >> ds,
+		  col, (blur  + ((1<<ds) -1))>> ds, blurbuf,
+		  picref->linesize[plane], random);
+    }
+  }
+#endif
+}
+
+static void copybox_mixold_alpha(AVFilterBufferRef *source,
+				 AVFilterBufferRef *picref,
+				 AVFilterBufferRef *lastref,
+				 BoxTrack *boxtrack,
+				 int hsub, int vsub,
+				 AVLFG *random) {
+  int xb = boxtrack->l;
+  int yb = boxtrack->t;
+  int hb = boxtrack->b - boxtrack->t;
+  int wb = boxtrack->r - boxtrack->l;
+
+  float blur_boundary = 0.2;
+  for (int y = FFMAX(yb, 0); y < picref->video->h && y < boxtrack->b; y++) {
+    float ynormsq = (y * 2.0 - (boxtrack->b + boxtrack->t)) / hb;
+    ynormsq *= ynormsq;
+    for (int plane = 0; plane < 3; plane++) {
+      int ysub = (y >> ((plane == 0) ? 0 : vsub));
+      unsigned char *row = picref->data[plane] +
+	picref->linesize[plane] * ysub;
+      unsigned char *srcrow = source->data[plane] +
+	picref->linesize[plane] * ysub;
+      unsigned char *lastrow = lastref->data[plane] +
+	picref->linesize[plane] * ysub;
+      
+      int thishsub = (plane == 0) ? 0 : hsub;
+      int xmin = FFMAX(xb, 0) >> thishsub;
+      int xmax = FFMIN(boxtrack->r, picref->video->w)
+	>> thishsub;
+      for (int x = xmin; x < xmax; x++) {
+	// TODO: do the alphablending in int.
+	// TODO: allow a flag for alpha blending or not.
+	float xnorm = ((x << thishsub) * 2.0 - (boxtrack->l + boxtrack->r))
+	  / wb;
+	float mixlast = ((av_lfg_get(random) % 20) + 10) / 40.0;
+	float alphax = (1 - sqrt(xnorm * xnorm + ynormsq));
+	if (alphax < 0) {
+	  row[x] = srcrow[x];
+	  continue;
+	}
+	if (alphax > blur_boundary)
+	  alphax = 1;
+	else
+	  alphax /= blur_boundary;
+	row[x] = (1 - alphax) * srcrow[x] +
+	  alphax * ((1 - mixlast) * row[x] + mixlast * lastrow[x]);
+      }
+    }
+  }
+}
+			    
+// In a picture carry out the obscuration of boxtrack.
+static void obscure_one_box(AVFilterBufferRef *source,
+			    AVFilterBufferRef *picref,
+			    AVFilterBufferRef *lastref,
+			    BoxTrack *boxtrack,
+			    int y0, int h, int hsub, int vsub,
+			    AVLFG *random) {
+  unsigned char *row[4];
+  int xb = boxtrack->l, yb = boxtrack->t;
+  int hb = boxtrack->b - boxtrack->t;
+  int wb = boxtrack->r - boxtrack->l;
+  int megapixel_size = 64;  // todo: get from file
+  int x, y;
+  if (boxtrack->method == redact_blur) {
+    const int blur = FFMAX(hb, wb);
+    unsigned char *blurbuf = (unsigned char *)av_malloc(blur);
+    blur_one_round(picref, boxtrack, y0, h, hsub, vsub, blur, blurbuf, random);
+    copybox_mixold_alpha(source, picref,
+			 ((lastref==NULL)?source:lastref),
+			 boxtrack, hsub, vsub, random);
+    av_free(blurbuf);
+    return;
+  }
+
+  for (y = FFMAX(yb, y0); y < (y0 + h) && y < (yb + hb); y++) {
+    row[0] = picref->data[0] + y * picref->linesize[0];
+
+    for (int plane = 1; plane < 3; plane++)
+      row[plane] = picref->data[plane] +
+	picref->linesize[plane] * (y >> vsub);
+
+    for (x = FFMAX(xb, 0); x < (xb + wb) && x < picref->video->w; x++) {
+      double alpha = (double)boxtrack->yuv_color[A] / 255;
+      if (boxtrack->method == redact_solid) {
+	row[0][x] = (1 - alpha) * row[0][x] +
+	  alpha * boxtrack->yuv_color[Y];
+	// todo: if hsub is non-zero this will do the same pixel mutliple times.
+	// which is wasteful. Wrong if alpha is != 1
+	row[1][x >> hsub] = (1 - alpha) * row[1][x >> hsub] +
+	  alpha * boxtrack->yuv_color[U];
+	row[2][x >> hsub] = (1 - alpha) * row[2][x >> hsub] +
+	  alpha * boxtrack->yuv_color[V];
+      } else if (boxtrack->method == redact_pixellate) {
+	int x_quant = (x / megapixel_size) * megapixel_size;
+	int y_quant = (y / megapixel_size) * megapixel_size;
+	row[0][x] = (picref->data[0] + y_quant *
+		     picref->linesize[0])[x_quant];
+	row[1][x >> hsub] = (picref->data[1] + picref->linesize[1] *
+	   (y_quant >> vsub))[x_quant >> hsub];
+	row[2][x >> hsub] = (picref->data[2] + picref->linesize[2] *
+	   (y_quant >> vsub))[x_quant >> hsub];
+      }
+    }
+  }
+}
+
+// Set all elements of planes 0,1,2 to val: 128=grey 0=green
+static void erase_output2(AVFilterBufferRef *outpic,
+			  int y0, int h, int hsub, int vsub,
+			  unsigned char val) {
+  unsigned char v[] = { 16, 128, 128};
+  for (int y = y0; y < (y0 + h); y++) {
+    for (int plane = 0; plane < 3; plane++) {
+      uint8_t *outrow = outpic->data[plane] +
+	outpic->linesize[plane] * (y >> ((plane == 0)?0:vsub));
+      const int xmax = outpic->video->w >> ((plane == 0)?0:hsub);
+      memset(outrow, v[plane], xmax);
+    }  // plane
+  }  // y
+}
+static void copy_all(AVFilterBufferRef *picref,
+		     AVFilterBufferRef *outpic,
+		     int hsub, int vsub) {
+  for (int y = 0; y < picref->video->h; y++) {
+    for (int plane = 0; plane < 3; plane++) {
+      uint8_t *row = picref->data[plane] +
+	picref->linesize[plane] * (y >> ((plane == 0)?0:vsub));
+      uint8_t *outrow = outpic->data[plane] +
+	outpic->linesize[plane] * (y >> ((plane == 0)?0:vsub));
+      int xwid = picref->video->w >> ((plane == 0)?0:hsub);
+      memcpy(outrow, row, xwid);
+    }  // plane
+  }  // y
+}
+
+// Copy one box from the input to the output.
+static void copy_one_box(AVFilterBufferRef *picref,
+			 AVFilterBufferRef *outpic,
+			 BoxTrack *boxtrack,
+			 int y0, int h, int hsub, int vsub) {
+  int xb = boxtrack->l;
+  int yb = boxtrack->t;
+  int hb = boxtrack->b - boxtrack->t;
+  int wb = boxtrack->r - boxtrack->l;
+
+  for (int y = FFMAX(yb, y0); y < (y0 + h) && y < (yb + hb); y++) {
+    for (int plane = 0; plane < 3; plane++) {
+      uint8_t *row = picref->data[plane] +
+	picref->linesize[plane] * (y >> ((plane == 0)?0:vsub));
+      uint8_t *outrow = outpic->data[plane] +
+	outpic->linesize[plane] * (y >> ((plane == 0)?0:vsub));
+      int xmin = FFMAX(xb, 0)  >> ((plane == 0)?0:hsub);
+      int xmax = FFMIN((xb + wb), picref->video->w)
+	>> ((plane == 0)?0:hsub);
+      memcpy(outrow + xmin, row + xmin, xmax - xmin);
+    }  // plane
+  }  // y
+}
+
+static void end_frame(AVFilterLink *inlink)
+{
+  AVFilterContext *ctx = inlink->dst;
+  RedactionContext *redaction = inlink->dst->priv;
+  AVFilterBufferRef *picref = inlink->cur_buf;
+  AVFilterLink *outlink0 = inlink->dst->outputs[0];
+  AVFilterBufferRef *outpic0 = outlink0->out_buf;
+  AVFilterLink *outlink1 = inlink->dst->outputs[1];
+  AVFilterBufferRef *outpic1 = outlink1->out_buf;
+  int box = 0;
+  statm_t status;
+
+  if (logging)
+    av_log(ctx, AV_LOG_INFO, "vf_redact start\n");
+  // Put the original into outpic0.
+  copy_all(picref, outpic0, redaction->hsub, redaction->vsub);
+  /* erase_output2(inlink->dst->outputs[0]->out_buf, 0, inlink->h, */
+  /* 		redaction->hsub, redaction->vsub, 0); */
+  // outpic1 is the redaction reversal data, initially blank.
+  erase_output2(outpic1, 0, inlink->h, redaction->hsub, redaction->vsub, 40);
+  // First backup the boxes to-be-redacted
+  for (box = redaction->numtracks -1; box >= 0; --box) {
     BoxTrack *boxtrack = redaction->boxtracks[box];
 
     // Tracks are sorted by start time, so if this one starts in the future
@@ -236,52 +596,46 @@ static void draw_slice(AVFilterLink *inlink, int y0, int h, int slice_dir)
       // Reduce the count.
       redaction->boxtracks[--redaction->numtracks] = NULL;
     } else {
-      int xb = boxtrack->l, yb = boxtrack->t;
-      int hb = boxtrack->b - boxtrack->t;
-      int wb = boxtrack->r - boxtrack->l;
-      int megapixel_size = 64;  // todo: get from file
-      for (y = FFMAX(yb, y0); y < (y0 + h) && y < (yb + hb); y++) {
-	row[0] = picref->data[0] + y * picref->linesize[0];
-
-	for (int plane = 1; plane < 3; plane++)
-	  row[plane] = picref->data[plane] +
-	    picref->linesize[plane] * (y >> redaction->vsub);
-
-	for (x = FFMAX(xb, 0); x < (xb + wb) && x < picref->video->w; x++) {
-	  double alpha = (double)boxtrack->yuv_color[A] / 255;
-
-	  if (boxtrack->method == redact_solid) {
-	    row[0][x                 ] =
-	      (1 - alpha) * row[0][x                 ] +
-	      alpha * boxtrack->yuv_color[Y];
-	    row[1][x >> redaction->hsub] =
-	      (1 - alpha) * row[1][x >> redaction->hsub] +
-	      alpha * boxtrack->yuv_color[U];
-	    row[2][x >> redaction->hsub] =
-	      (1 - alpha) * row[2][x >> redaction->hsub] +
-	      alpha * boxtrack->yuv_color[V];
-	  } else if (boxtrack->method == redact_pixellate) {
-	    int x_quant = (x / megapixel_size) * megapixel_size;
-	    int y_quant = (y / megapixel_size) * megapixel_size;
-	    row[0][x] = (picref->data[0] + y_quant *
-			 picref->linesize[0])[x_quant];
-	    row[1][x >> redaction->hsub] =
-	      (picref->data[1] + picref->linesize[1] *
-	       (y_quant >> redaction->vsub))[x_quant >> redaction->hsub];
-	    row[2][x >> redaction->hsub] =
-	      (picref->data[2] + picref->linesize[2] *
-	       (y_quant >> redaction->vsub))[x_quant >> redaction->hsub];
-	  }
-	}
-      }
+      copy_one_box(picref, outpic1, boxtrack, 0, inlink->h,
+      		   redaction->hsub, redaction->vsub);
     }
   }
-  avfilter_draw_slice(inlink->dst->outputs[0], y0, h, 1);
+  // Now store the redacted video into outpic0.
+  for (box = redaction->numtracks -1; box >= 0; --box) {
+    BoxTrack *boxtrack = redaction->boxtracks[box];
+
+    if (boxtrack->start > redaction->time_seconds)
+      break;
+    obscure_one_box(picref, outpic0, redaction->lastredacted,
+		    boxtrack, 0, inlink->h, 
+		    redaction->hsub, redaction->vsub,
+		    &redaction->random);
+  }
+  avfilter_draw_slice(inlink->dst->outputs[0], 0, inlink->h, 1);
+  avfilter_draw_slice(inlink->dst->outputs[1], 0, inlink->h, 1);
+  // Keep track of the previous redacted output.
+  if (redaction->lastredacted != NULL)
+    avfilter_unref_buffer(redaction->lastredacted);
+  redaction->lastredacted = avfilter_ref_buffer(outlink0->out_buf,  ~0);
+  avfilter_end_frame(inlink->dst->outputs[0]);
+  avfilter_end_frame(inlink->dst->outputs[1]);
+  avfilter_unref_buffer(picref);
+  avfilter_unref_buffer(outlink0->out_buf);
+  avfilter_unref_buffer(outlink1->out_buf);
+  if (logging) {
+    av_log(ctx, AV_LOG_INFO, "doneendframe1\n");
+    read_off_memory_status(&status);
+  // unsigned long size,resident,share,text,lib,data,dt;
+    av_log(ctx, AV_LOG_INFO, "Redaction memory RSS %lu data %lu\n",
+	 status.resident, status.data);
+  }
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
 {
   RedactionContext *redaction= ctx->priv;
+  if (redaction->lastredacted != NULL)
+    avfilter_unref_buffer(redaction->lastredacted);
   for (int i = 0; i < redaction->numtracks; ++i) {
     av_free(redaction->boxtracks[i]);
   }
@@ -297,19 +651,23 @@ AVFilter avfilter_vf_redact = {
   .uninit      = uninit,
 
   .query_formats   = query_formats,
-  .inputs    = (AVFilterPad[]) {{ .name             = "default",
-				  .type             = AVMEDIA_TYPE_VIDEO,
-				  .config_props     = config_input,
-				  .get_video_buffer =
-				  avfilter_null_get_video_buffer,
-				  .start_frame      = start_frame,
-				  .draw_slice       = draw_slice,
-				  .end_frame        = avfilter_null_end_frame,
-				  .min_perms        = AV_PERM_WRITE |
-				  AV_PERM_READ,
-				  .rej_perms        = AV_PERM_PRESERVE },
-				{ .name = NULL}},
-  .outputs   = (AVFilterPad[]) {{ .name             = "default",
-				  .type             = AVMEDIA_TYPE_VIDEO, },
-				{ .name = NULL}},
+  .inputs    = (const AVFilterPad[]) {
+    { .name             = "default",
+      .type             = AVMEDIA_TYPE_VIDEO,
+      .config_props     = config_input,
+      .get_video_buffer =
+      avfilter_null_get_video_buffer,
+      .start_frame      = start_frame,
+      .draw_slice       = avfilter_null_draw_slice,
+      .end_frame        = end_frame,
+      .min_perms        = AV_PERM_WRITE | AV_PERM_READ,
+      // .rej_perms        = AV_PERM_PRESERVE
+    },
+    { .name = NULL}},
+  .outputs   = (const AVFilterPad[]) {
+    { .name             = "output1",
+      .type             = AVMEDIA_TYPE_VIDEO, },
+    { .name             = "output2",
+      .type             = AVMEDIA_TYPE_VIDEO, },
+    { .name = NULL}},
 };
