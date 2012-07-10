@@ -2,7 +2,8 @@
  * Copyright (c) 2011 Andrew Senior 
  *
  * This file is for use with ffmpeg
- *
+ * Version 0.04 - reverting to single output.
+ * No memory leak on linux. Checked with ffmpeg 0.10.4
  */
 
 /**
@@ -24,6 +25,7 @@
  * "blur" for face blurring.
  * or an ffmpeg color specifier for solid redaction. 
  * The file can contain comments, ie lines beginning with "#".
+ * Based on vf_transpose.
  */
 
 /* Use:
@@ -265,36 +267,13 @@ static void start_frame(AVFilterLink *inlink, AVFilterBufferRef *picref)
   AVFilterContext *ctx = inlink->dst;
   RedactionContext *redaction = inlink->dst->priv;
   AVFilterLink *outlink0 = inlink->dst->outputs[0];
-  AVFilterLink *outlink1 = inlink->dst->outputs[1];
-  AVFilterBufferRef *outpicref = NULL;
   
-  if (logging)
-    av_log(ctx, AV_LOG_INFO, "startstartframe\n");
   redaction->time_seconds = picref->pts * av_q2d(inlink->time_base);
-  outpicref = avfilter_get_video_buffer(outlink0, AV_PERM_WRITE,
-					outlink0->w, outlink0->h);
-  avfilter_copy_buffer_ref_props(outpicref, picref);
-  outpicref->video->w = outlink0->w;
-  outpicref->video->h = outlink0->h;
-  outlink0->out_buf = outpicref;
+  outlink0->out_buf = avfilter_get_video_buffer(outlink0, AV_PERM_WRITE,
+						outlink0->w, outlink0->h);
   outlink0->out_buf->pts = picref->pts;
-  outlink0->out_buf->pos = picref->pos;
-
   avfilter_start_frame(outlink0,
-		       avfilter_ref_buffer(outlink0->out_buf,  ~0));
-
-  outpicref = avfilter_get_video_buffer(outlink1, AV_PERM_WRITE,
-					outlink1->w, outlink1->h);
-  avfilter_copy_buffer_ref_props(outpicref, picref);
-  outpicref->video->w = outlink0->w;
-  outpicref->video->h = outlink0->h;
-  outlink1->out_buf = outpicref;
-  outlink1->out_buf->pts = picref->pts;
-  outlink1->out_buf->pos = picref->pos;
-  avfilter_start_frame(outlink1,outlink1->out_buf);
-  //		       avfilter_ref_buffer(outlink1->out_buf,  ~0));
-  if (logging)
-    av_log(ctx, AV_LOG_INFO, "endstartframe\n");
+		       avfilter_ref_buffer(outlink0->out_buf, ~0));
 }
 
 static int noise = 10;
@@ -519,6 +498,8 @@ static void erase_output2(AVFilterBufferRef *outpic,
     }  // plane
   }  // y
 }
+
+// Copy all the image data from picref to outpic.
 static void copy_all(AVFilterBufferRef *picref,
 		     AVFilterBufferRef *outpic,
 		     int hsub, int vsub) {
@@ -561,24 +542,14 @@ static void copy_one_box(AVFilterBufferRef *picref,
 static void end_frame(AVFilterLink *inlink)
 {
   AVFilterContext *ctx = inlink->dst;
-  RedactionContext *redaction = inlink->dst->priv;
-  AVFilterBufferRef *picref = inlink->cur_buf;
-  AVFilterLink *outlink0 = inlink->dst->outputs[0];
-  AVFilterBufferRef *outpic0 = outlink0->out_buf;
-  AVFilterLink *outlink1 = inlink->dst->outputs[1];
-  AVFilterBufferRef *outpic1 = outlink1->out_buf;
-  int box = 0;
   statm_t status;
+  RedactionContext *redaction = inlink->dst->priv;
+  AVFilterBufferRef *inpic  = inlink->cur_buf;
+  AVFilterBufferRef *outpic0 = inlink->dst->outputs[0]->out_buf;
+  AVFilterLink *outlink0 = inlink->dst->outputs[0];
+  int box = 0;
 
-  if (logging)
-    av_log(ctx, AV_LOG_INFO, "vf_redact start\n");
-  // Put the original into outpic0.
-  copy_all(picref, outpic0, redaction->hsub, redaction->vsub);
-  /* erase_output2(inlink->dst->outputs[0]->out_buf, 0, inlink->h, */
-  /* 		redaction->hsub, redaction->vsub, 0); */
-  // outpic1 is the redaction reversal data, initially blank.
-  erase_output2(outpic1, 0, inlink->h, redaction->hsub, redaction->vsub, 40);
-  // First backup the boxes to-be-redacted
+  copy_all(inpic, outpic0, redaction->hsub, redaction->vsub);
   for (box = redaction->numtracks -1; box >= 0; --box) {
     BoxTrack *boxtrack = redaction->boxtracks[box];
 
@@ -596,8 +567,9 @@ static void end_frame(AVFilterLink *inlink)
       // Reduce the count.
       redaction->boxtracks[--redaction->numtracks] = NULL;
     } else {
-      copy_one_box(picref, outpic1, boxtrack, 0, inlink->h,
-      		   redaction->hsub, redaction->vsub);
+      // For output of redaction reversal.
+      /* copy_one_box(picref, outpic1, boxtrack, 0, inlink->h, */
+      /* 		   redaction->hsub, redaction->vsub); */
     }
   }
   // Now store the redacted video into outpic0.
@@ -606,29 +578,26 @@ static void end_frame(AVFilterLink *inlink)
 
     if (boxtrack->start > redaction->time_seconds)
       break;
-    obscure_one_box(picref, outpic0, redaction->lastredacted,
+    obscure_one_box(inpic, outpic0, redaction->lastredacted,
 		    boxtrack, 0, inlink->h, 
 		    redaction->hsub, redaction->vsub,
 		    &redaction->random);
   }
-  avfilter_draw_slice(inlink->dst->outputs[0], 0, inlink->h, 1);
-  avfilter_draw_slice(inlink->dst->outputs[1], 0, inlink->h, 1);
-  // Keep track of the previous redacted output.
+
+  if (logging) {
+    read_off_memory_status(&status);
+    av_log(ctx, AV_LOG_INFO, "Redaction memory RSS %lu data %lu\n",
+	   status.resident, status.data);
+  }
+
   if (redaction->lastredacted != NULL)
     avfilter_unref_buffer(redaction->lastredacted);
-  redaction->lastredacted = avfilter_ref_buffer(outlink0->out_buf,  ~0);
-  avfilter_end_frame(inlink->dst->outputs[0]);
-  avfilter_end_frame(inlink->dst->outputs[1]);
-  avfilter_unref_buffer(picref);
-  avfilter_unref_buffer(outlink0->out_buf);
-  avfilter_unref_buffer(outlink1->out_buf);
-  if (logging) {
-    av_log(ctx, AV_LOG_INFO, "doneendframe1\n");
-    read_off_memory_status(&status);
-  // unsigned long size,resident,share,text,lib,data,dt;
-    av_log(ctx, AV_LOG_INFO, "Redaction memory RSS %lu data %lu\n",
-	 status.resident, status.data);
-  }
+  redaction->lastredacted = avfilter_ref_buffer(outlink0->out_buf, ~0);
+
+  avfilter_unref_buffer(inpic);
+  avfilter_draw_slice(outlink0, 0, outpic0->video->h, 1);
+  avfilter_end_frame(outlink0);
+  avfilter_unref_buffer(outpic0);
 }
 
 static av_cold void uninit(AVFilterContext *ctx)
@@ -666,8 +635,6 @@ AVFilter avfilter_vf_redact = {
     { .name = NULL}},
   .outputs   = (const AVFilterPad[]) {
     { .name             = "output1",
-      .type             = AVMEDIA_TYPE_VIDEO, },
-    { .name             = "output2",
       .type             = AVMEDIA_TYPE_VIDEO, },
     { .name = NULL}},
 };
